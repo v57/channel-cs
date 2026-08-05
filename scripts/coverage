@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+mkdir -p coverage
+rm -f coverage/unit.info coverage/integration.info coverage/lcov.info
+
+dotnet test tests/ChannelCs.Tests/ChannelCs.Tests.csproj -c Release \
+  /p:CollectCoverage=true \
+  /p:CoverletOutputFormat=lcov \
+  /p:ExcludeByFile="**/obj/**" \
+  /p:CoverletOutput="$(pwd)/coverage/unit.info"
+
+dotnet test tests/ChannelCs.IntegrationTests/ChannelCs.IntegrationTests.csproj -c Release \
+  /p:CollectCoverage=true \
+  /p:CoverletOutputFormat=lcov \
+  /p:ExcludeByFile="**/obj/**" \
+  /p:CoverletOutput="$(pwd)/coverage/integration.info"
+
+lcov -a "$(pwd)/coverage/unit.info" -a "$(pwd)/coverage/integration.info" -o "$(pwd)/coverage/lcov.info" >/dev/null
+
+echo "LCOV written to coverage/lcov.info"

@@ -1,0 +1,15 @@
+# .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+
+# Test and coverage output
+coverage/
+TestResults/
+
+# Benchmark output
+/benchmark.json
+
+# macOS
+.DS_Store

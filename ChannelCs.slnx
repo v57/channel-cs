@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/bench/">
+    <Project Path="bench/ChannelCs.Benchmark/ChannelCs.Benchmark.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/ChannelCs.Client/ChannelCs.Client.csproj" />
+    <Project Path="src/ChannelCs.Process/ChannelCs.Process.csproj" />
+    <Project Path="src/ChannelCs.Server/ChannelCs.Server.csproj" />
+    <Project Path="src/ChannelCs/ChannelCs.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ChannelCs.IntegrationTests/ChannelCs.IntegrationTests.csproj" />
+    <Project Path="tests/ChannelCs.Tests/ChannelCs.Tests.csproj" />
+  </Folder>
+</Solution>
