@@ -370,6 +370,20 @@ public class Channel<TState>
             Stream(normalizedPrefix + pair.Key, pair.Value);
         }
 
+        Func<string, bool> Scoped(Func<string, bool> match) => normalizedPrefix.Length == 0
+            ? match
+            : path => path.StartsWith(normalizedPrefix, StringComparison.Ordinal) && match(path[normalizedPrefix.Length..]);
+
+        foreach (var (match, handler) in channel._otherPostApi)
+        {
+            PostOther(Scoped(match), handler);
+        }
+
+        foreach (var (match, handler) in channel._otherStreamApi)
+        {
+            StreamOther(Scoped(match), handler);
+        }
+
         return this;
     }
 

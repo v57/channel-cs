@@ -75,6 +75,26 @@ public sealed class DeepCoverageTests
     }
 
     [Fact]
+    public async Task Merge_Keeps_PostOther_And_StreamOther_Under_Prefix()
+    {
+        var inner = new Channel<Dictionary<string, object?>>()
+            .PostOther(path => path.StartsWith("dyn/", StringComparison.Ordinal), request => ValueTask.FromResult<object?>("post:" + request.Path))
+            .StreamOther(path => path == "feed", _ => ValueTask.FromResult(Yield("item")));
+        var outer = new Channel<Dictionary<string, object?>>().Merge(inner, "m");
+
+        var sender = outer.Process(new Dictionary<string, object?>());
+        Assert.Equal("post:m/dyn/x", await sender.SendAsync<string>("m/dyn/x"));
+        await Assert.ThrowsAnyAsync<Exception>(() => sender.SendAsync<string>("dyn/x"));
+        Assert.Equal("item", await FirstAsync(sender.Values<string>("m/feed")));
+        sender.Stop();
+
+        // Without a prefix the matchers are reused as-is
+        var flatSender = new Channel<Dictionary<string, object?>>().Merge(inner).Process(new Dictionary<string, object?>());
+        Assert.Equal("post:dyn/x", await flatSender.SendAsync<string>("dyn/x"));
+        flatSender.Stop();
+    }
+
+    [Fact]
     public async Task Channel_Error_And_Edge_Branches_Are_Handled()
     {
         var badSubscription = new Subscription
