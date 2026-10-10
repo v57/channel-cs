@@ -30,10 +30,16 @@ public sealed class Subscription
         return this;
     }
 
-    // Intentional TS parity: Body replaces the topic formatter.
-    public Subscription Body(Func<object?, string> formatter)
+    // Sets the body factory used by Send(request) and by the initial subscription reply (TS `body()`).
+    public Subscription Body(Func<object?, object?> factory)
     {
-        _topic = formatter;
+        _body = request => ValueTask.FromResult(factory(request));
+        return this;
+    }
+
+    public Subscription Body(Func<object?, Task<object?>> factory)
+    {
+        _body = request => new ValueTask<object?>(factory(request));
         return this;
     }
 
@@ -58,7 +64,8 @@ public sealed class Subscription
 
     public void Publish(string topic, object? body)
     {
-        if (body is null)
+        // TS parity: `if (!body) return` drops every falsy body (null, false, 0, NaN, "").
+        if (IsFalsy(body))
         {
             return;
         }
@@ -79,6 +86,39 @@ public sealed class Subscription
     public void RemovePublisher(ISubscriptionPublisher publisher)
     {
         Publishers.Remove(publisher);
+    }
+
+    /// <summary>JavaScript truthiness for a channel body.</summary>
+    public static bool IsFalsy(object? value)
+    {
+        switch (value)
+        {
+            case null:
+                return true;
+            case bool b:
+                return !b;
+            case string s:
+                return s.Length == 0;
+            case double d:
+                return d == 0 || double.IsNaN(d);
+            case float f:
+                return f == 0 || float.IsNaN(f);
+            case decimal m:
+                return m == 0;
+            case int or long or short or sbyte or byte or uint or ulong or ushort:
+                return Convert.ToDecimal(value, System.Globalization.CultureInfo.InvariantCulture) == 0;
+            case System.Text.Json.JsonElement element:
+                return element.ValueKind switch
+                {
+                    System.Text.Json.JsonValueKind.Null or System.Text.Json.JsonValueKind.Undefined
+                        or System.Text.Json.JsonValueKind.False => true,
+                    System.Text.Json.JsonValueKind.String => element.GetString()!.Length == 0,
+                    System.Text.Json.JsonValueKind.Number => element.GetDouble() == 0,
+                    _ => false,
+                };
+            default:
+                return false;
+        }
     }
 
     internal string TopicFor(object? request)

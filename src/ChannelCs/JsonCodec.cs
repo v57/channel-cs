@@ -24,7 +24,13 @@ public static class JsonCodec
         if (reader.TokenType == JsonTokenType.StartArray)
         {
             var messages = JsonSerializer.Deserialize(utf8.Span, ChannelJsonContext.Default.ChannelMessageArray);
-            return messages ?? Array.Empty<ChannelMessage>();
+            if (messages is null)
+            {
+                return Array.Empty<ChannelMessage>();
+            }
+
+            // `[null, {...}]`: skip null entries instead of failing the whole batch.
+            return Array.IndexOf(messages, null) < 0 ? messages : messages.Where(static m => m is not null).ToArray();
         }
 
         if (reader.TokenType == JsonTokenType.StartObject)

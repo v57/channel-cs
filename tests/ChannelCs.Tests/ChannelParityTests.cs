@@ -162,7 +162,7 @@ public sealed class ChannelParityTests
     }
 
     [Fact]
-    public void Subscription_Topic_And_Body_Both_Replace_Topic_Formatter()
+    public void Subscription_Topic_And_Body_Set_Separate_Formatters()
     {
         var subscription = new Subscription();
         var events = new List<SubscriptionEvent>();
@@ -173,7 +173,7 @@ public sealed class ChannelParityTests
         subscription.Body(request => $"body-{request}");
         subscription.Send("x", "payload");
 
-        Assert.Equal([new SubscriptionEvent("body-x", "payload")], events);
+        Assert.Equal([new SubscriptionEvent("topic-x", "payload")], events);
     }
 
     [Fact]

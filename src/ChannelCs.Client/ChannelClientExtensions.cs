@@ -19,7 +19,7 @@ public static class ChannelClientExtensions
     {
         options ??= new ClientOptions<TState>();
 
-        var webSocket = new WebSocketClient(new Uri(address), options.Headers);
+        var webSocket = new WebSocketClient(new Uri(address), options.Headers, options.MaxMessageSize);
         var sender = channel.CreateSender(webSocket);
         var topics = new ConcurrentDictionary<string, byte>();
         var state = options.StateFactory is not null
@@ -77,6 +77,7 @@ public static class ChannelClientExtensions
             channel.Disconnect(state, sender);
         };
 
+        webSocket.OnProtocolError = error => channel.FailPending(sender, error);
         webSocket.OnMessage = messages => channel.Receive(messages, controller);
         return new ClientSender<TState>(sender, webSocket);
     }

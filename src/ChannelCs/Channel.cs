@@ -110,21 +110,48 @@ public class Channel<TState>
             request.CancelFromDisconnect();
         }
 
-        lock (_gate)
-        {
-            var toDelete = _requests
-                .Where(pair => ReferenceEquals(pair.Value.Sender, sender))
-                .Select(pair => pair.Key)
-                .ToArray();
-
-            foreach (var key in toDelete)
-            {
-                _requests.Remove(key);
-            }
-        }
+        // Outgoing calls of this sender can never be answered now: settle them instead of leaving them hanging.
+        FailPending(sender, "disconnected");
 
         sender.Streams.Clear();
         sender.Requests.Clear();
+    }
+
+    /// <summary>
+    /// Settles every outgoing request, stream and subscription made through <paramref name="sender"/> with
+    /// <paramref name="error"/>. Used when the transport closes for good or receives a reply it can't decode,
+    /// so no caller waits forever.
+    /// </summary>
+    public void FailPending(ChannelSender<TState> sender, string error)
+    {
+        List<(int Id, PendingRequest Request)> failed = [];
+        lock (_gate)
+        {
+            foreach (var pair in _requests)
+            {
+                if (ReferenceEquals(pair.Value.Sender, sender))
+                {
+                    failed.Add((pair.Key, pair.Value));
+                }
+            }
+
+            foreach (var item in failed)
+            {
+                _requests.Remove(item.Id);
+            }
+        }
+
+        foreach (var item in failed)
+        {
+            try
+            {
+                item.Request.Response(new ChannelMessage { Id = item.Id, Error = error });
+            }
+            catch
+            {
+                // A failing response callback must not stop the others from settling.
+            }
+        }
     }
 
     internal ChannelMessage MakeRequest(
@@ -266,9 +293,10 @@ public class Channel<TState>
                 request?.Response(message);
             }
 
-            if (message.Body is not null)
+            // TS parity: `if (some.body)` - falsy event bodies are not delivered.
+            if (!Subscription.IsFalsy(message.Body))
             {
-                controller.Event(message.Topic, message.Body);
+                controller.Event(message.Topic, message.Body!);
             }
 
             return;
@@ -355,10 +383,21 @@ public class Channel<TState>
         return Interlocked.Increment(ref _id) - 1;
     }
 
+    private static ChannelMessage Reply(ChannelMessage request)
+    {
+        return new ChannelMessage { Id = request.Id, RawId = request.Id is null ? request.RawId : null };
+    }
+
+    private static bool HasId(ChannelMessage message)
+    {
+        return message.Id is not null || message.RawId is not null;
+    }
+
     private void HandlePathRequest(ChannelMessage message, IChannelController<TState> controller)
     {
         var id = message.Id;
         var path = message.Path!;
+        var hasId = HasId(message);
 
         var api = _postApi.TryGetValue(path, out var handler)
             ? handler
@@ -391,7 +430,7 @@ public class Channel<TState>
                 path,
                 task));
 
-            if (id is not int responseId)
+            if (!hasId)
             {
                 _ = IgnoreValueTask(body);
                 return;
@@ -399,31 +438,39 @@ public class Channel<TState>
 
             if (body.IsCompletedSuccessfully)
             {
-                controller.Response(new ChannelMessage { Id = responseId, Body = body.Result });
-                controller.Sender.Requests.TryRemove(responseId, out _);
+                var reply = Reply(message);
+                reply.Body = body.Result;
+                controller.Response(reply);
+                if (id is int responseId)
+                {
+                    controller.Sender.Requests.TryRemove(responseId, out _);
+                }
+
                 return;
             }
 
-            if (task is not null)
+            if (task is not null && id is int taskId)
             {
-                controller.Sender.Requests[responseId] = task;
+                controller.Sender.Requests[taskId] = task;
             }
 
-            _ = CompletePathRequestAsync(body, responseId, task, controller);
+            _ = CompletePathRequestAsync(body, message, task, controller);
         }
         catch (Exception exception)
         {
-            if (id is not int responseId)
+            if (!hasId)
             {
                 return;
             }
 
             if (task?.IsCancelled != true)
             {
-                controller.Response(new ChannelMessage { Id = responseId, Error = ToError(exception) });
+                var reply = Reply(message);
+                reply.Error = ToError(exception);
+                controller.Response(reply);
             }
 
-            if (task is not null)
+            if (task is not null && id is int responseId)
             {
                 controller.Sender.Requests.TryRemove(responseId, out _);
             }
@@ -432,7 +479,7 @@ public class Channel<TState>
 
     private async Task CompletePathRequestAsync(
         ValueTask<object?> bodyTask,
-        int id,
+        ChannelMessage request,
         CancellableRequest? task,
         IChannelController<TState> controller)
     {
@@ -441,19 +488,23 @@ public class Channel<TState>
             var body = await bodyTask.ConfigureAwait(false);
             if (task?.IsCancelled != true)
             {
-                controller.Response(new ChannelMessage { Id = id, Body = body });
+                var reply = Reply(request);
+                reply.Body = body;
+                controller.Response(reply);
             }
         }
         catch (Exception exception)
         {
             if (task?.IsCancelled != true)
             {
-                controller.Response(new ChannelMessage { Id = id, Error = ToError(exception) });
+                var reply = Reply(request);
+                reply.Error = ToError(exception);
+                controller.Response(reply);
             }
         }
         finally
         {
-            if (task is not null)
+            if (task is not null && request.Id is int id)
             {
                 controller.Sender.Requests.TryRemove(id, out _);
             }
@@ -464,6 +515,13 @@ public class Channel<TState>
     {
         if (message.Id is not int id)
         {
+            if (message.RawId is not null)
+            {
+                var reply = Reply(message);
+                reply.Error = "stream requires a numeric id";
+                controller.Response(reply);
+            }
+
             return;
         }
 
@@ -553,7 +611,6 @@ public class Channel<TState>
 
     private void HandleSubscriptionRequest(ChannelMessage message, IChannelController<TState> controller)
     {
-        var id = message.Id;
         try
         {
             if (_eventsApi is null || !_eventsApi.TryGetValue(message.Sub!, out var subscription))
@@ -568,24 +625,29 @@ public class Channel<TState>
             if (bodyTask.IsCompletedSuccessfully)
             {
                 controller.Subscribe(topic);
-                controller.Response(new ChannelMessage { Id = id, Topic = topic, Body = bodyTask.Result });
+                var reply = Reply(message);
+                reply.Topic = topic;
+                reply.Body = bodyTask.Result;
+                controller.Response(reply);
                 return;
             }
 
-            _ = CompleteSubscriptionAsync(bodyTask, id, topic, controller);
+            _ = CompleteSubscriptionAsync(bodyTask, message, topic, controller);
         }
         catch (Exception exception)
         {
-            if (id is not null)
+            if (HasId(message))
             {
-                controller.Response(new ChannelMessage { Id = id, Error = ToError(exception) });
+                var reply = Reply(message);
+                reply.Error = ToError(exception);
+                controller.Response(reply);
             }
         }
     }
 
     private async Task CompleteSubscriptionAsync(
         ValueTask<object?> bodyTask,
-        int? id,
+        ChannelMessage request,
         string topic,
         IChannelController<TState> controller)
     {
@@ -593,11 +655,16 @@ public class Channel<TState>
         {
             var body = await bodyTask.ConfigureAwait(false);
             controller.Subscribe(topic);
-            controller.Response(new ChannelMessage { Id = id, Topic = topic, Body = body });
+            var reply = Reply(request);
+            reply.Topic = topic;
+            reply.Body = body;
+            controller.Response(reply);
         }
         catch (Exception exception)
         {
-            controller.Response(new ChannelMessage { Id = id, Error = ToError(exception) });
+            var reply = Reply(request);
+            reply.Error = ToError(exception);
+            controller.Response(reply);
         }
     }
 
@@ -668,6 +735,12 @@ public class Channel<TState>
         if (exception is ChannelException channelException)
         {
             return channelException.Message;
+        }
+
+        // Don't leak System.Text.Json internals (CLR type names, byte offsets) to the peer.
+        if (exception is System.Text.Json.JsonException)
+        {
+            return "invalid body";
         }
 
         return exception.Message;

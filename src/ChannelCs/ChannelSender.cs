@@ -162,7 +162,15 @@ public sealed class ChannelSender<TState> : IChannelSender
                 }
                 else
                 {
-                    tcs.TrySetResult(JsonCodec.DeserializeBody<T>(response.Body));
+                    try
+                    {
+                        tcs.TrySetResult(JsonCodec.DeserializeBody<T>(response.Body));
+                    }
+                    catch (Exception exception)
+                    {
+                        // A body that doesn't fit T fails this call only, never the receive loop.
+                        tcs.TrySetException(exception);
+                    }
                 }
 
                 if (transportId is long sentId)
@@ -294,6 +302,7 @@ public sealed class ChannelSender<TState> : IChannelSender
     public void Stop()
     {
         _connection.Stop();
+        _channel.FailPending(this, "disconnected");
     }
 
     private sealed class RequestHandle<T> : IRequestHandle<T>

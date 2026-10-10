@@ -7,6 +7,12 @@ public sealed class ListenOptions<TState>
     public Action<BodyContext<TState>>? OnConnect { get; init; }
 
     public Action<BodyContext<TState>>? OnDisconnect { get; init; }
+
+    /// <summary>
+    /// Largest incoming message (all fragments together) accepted, in bytes. Default 16 MiB, like TS/Bun.
+    /// A bigger message closes the connection with 1009.
+    /// </summary>
+    public int MaxMessageSize { get; init; } = 16 * 1024 * 1024;
 }
 
 public sealed class BodyContext<TState>

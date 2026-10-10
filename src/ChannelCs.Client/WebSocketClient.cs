@@ -22,12 +22,28 @@ public sealed class WebSocketClient : IConnection, IDisposable
     private int _isWaiting;
     private int _isWaitingLength;
 
-    public WebSocketClient(Uri address, Func<ValueTask<IReadOnlyDictionary<string, string>>>? headers = null)
+    /// <summary>Default cap for one incoming message (TS/Bun's default max payload).</summary>
+    public const int DefaultMaxMessageSize = 16 * 1024 * 1024;
+
+    public WebSocketClient(
+        Uri address,
+        Func<ValueTask<IReadOnlyDictionary<string, string>>>? headers = null,
+        int maxMessageSize = DefaultMaxMessageSize)
     {
         _address = address;
         _headers = headers;
+        MaxMessageSize = maxMessageSize > 0 ? maxMessageSize : DefaultMaxMessageSize;
         _ = Task.Run(RunAsync);
     }
+
+    public int MaxMessageSize { get; }
+
+    /// <summary>
+    /// Called when the peer sends something this client can't use (undecodable reply, oversized or invalid
+    /// frame, rejected handshake). Pending calls can't be matched to a reply any more, so the owner should
+    /// settle them with this error instead of letting them wait forever.
+    /// </summary>
+    public Action<string>? OnProtocolError { get; set; }
 
     public Func<Task>? OnOpenAsync { get; set; }
 
@@ -175,7 +191,14 @@ public sealed class WebSocketClient : IConnection, IDisposable
         var element = JsonCodec.ToJsonElement(body);
         foreach (var handler in handlers.Values)
         {
-            handler(element);
+            try
+            {
+                handler(element);
+            }
+            catch
+            {
+                // A throwing event handler must not tear down the receive loop.
+            }
         }
     }
 
@@ -206,7 +229,18 @@ public sealed class WebSocketClient : IConnection, IDisposable
                     }
                 }
 
-                await socket.ConnectAsync(_address, _lifetime.Token).ConfigureAwait(false);
+                try
+                {
+                    await socket.ConnectAsync(_address, _lifetime.Token).ConfigureAwait(false);
+                }
+                catch (WebSocketException exception) when (exception.WebSocketErrorCode == WebSocketError.NotAWebSocket)
+                {
+                    // The server answered but refused the upgrade (e.g. HTTP 500). Queued calls would be resent
+                    // into the same refusal forever: fail them, keep retrying for new ones.
+                    ReportProtocolError("connection rejected by server");
+                    throw;
+                }
+
                 var replay = _pending.Values.ToArray();
                 _socket = socket;
                 IsConnected = true;
@@ -223,13 +257,20 @@ public sealed class WebSocketClient : IConnection, IDisposable
 
                 await ReceiveLoopAsync(socket).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
             {
                 break;
             }
+            catch (WebSocketException exception) when (
+                ReferenceEquals(_socket, socket)
+                && exception.WebSocketErrorCode is not (WebSocketError.ConnectionClosedPrematurely or WebSocketError.Success))
+            {
+                // Protocol violation from the peer (bad frame, invalid UTF-8, ...): no reply will be matched.
+                ReportProtocolError("invalid message from server");
+            }
             catch
             {
-                // Keep retrying while running.
+                // Transport loss: keep retrying while running; pending requests are replayed on reconnect (TS parity).
             }
             finally
             {
@@ -276,9 +317,13 @@ public sealed class WebSocketClient : IConnection, IDisposable
                     return;
                 }
 
-                if (result.MessageType != WebSocketMessageType.Text)
+                // Binary messages are decoded like text ones: dropping them stranded the pending call.
+                if (stream.Length + result.Count > MaxMessageSize)
                 {
-                    continue;
+                    ReportProtocolError("message too big");
+                    await CloseQuietlyAsync(socket, WebSocketCloseStatus.MessageTooBig, "message too big")
+                        .ConfigureAwait(false);
+                    return;
                 }
 
                 stream.Write(buffer.AsSpan(0, result.Count));
@@ -290,8 +335,52 @@ public sealed class WebSocketClient : IConnection, IDisposable
                 continue;
             }
 
-            var messages = JsonCodec.Deserialize(stream.ToArray());
-            OnMessage?.Invoke(messages);
+            IReadOnlyList<ChannelMessage> messages;
+            try
+            {
+                messages = JsonCodec.Deserialize(stream.GetBuffer().AsMemory(0, (int)stream.Length));
+            }
+            catch (Exception exception) when (exception is JsonException or InvalidOperationException
+                or ArgumentException or DecoderFallbackException)
+            {
+                // The reply can't be matched to its request: settle the pending calls instead of hanging them.
+                ReportProtocolError("invalid message from server");
+                continue;
+            }
+
+            try
+            {
+                OnMessage?.Invoke(messages);
+            }
+            catch
+            {
+                // Errors in response/handler callbacks stay local to that message.
+            }
+        }
+    }
+
+    private void ReportProtocolError(string error)
+    {
+        try
+        {
+            OnProtocolError?.Invoke(error);
+        }
+        catch
+        {
+            // Never let the owner's callback break the receive loop.
+        }
+    }
+
+    private static async Task CloseQuietlyAsync(ClientWebSocket socket, WebSocketCloseStatus status, string reason)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            await socket.CloseOutputAsync(status, reason, timeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best effort; the socket is disposed by the caller.
         }
     }
 

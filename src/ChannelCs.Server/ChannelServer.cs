@@ -137,6 +137,7 @@ public sealed class ChannelServer<TState> : IDisposable
     {
         var buffer = new byte[8192];
         using var stream = new MemoryStream();
+        var maxMessageSize = _options.MaxMessageSize > 0 ? _options.MaxMessageSize : 16 * 1024 * 1024;
 
         while (socket.State == WebSocketState.Open)
         {
@@ -168,6 +169,21 @@ public sealed class ChannelServer<TState> : IDisposable
                     continue;
                 }
 
+                if (stream.Length + result.Count > maxMessageSize)
+                {
+                    try
+                    {
+                        await socket.CloseAsync(WebSocketCloseStatus.MessageTooBig, "message too big", CancellationToken.None)
+                            .ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Peer may already be gone.
+                    }
+
+                    return;
+                }
+
                 stream.Write(buffer.AsSpan(0, result.Count));
             }
             while (!result.EndOfMessage);
@@ -180,16 +196,31 @@ public sealed class ChannelServer<TState> : IDisposable
             IReadOnlyList<ChannelMessage> requests;
             try
             {
-                requests = JsonCodec.Deserialize(stream.ToArray());
+                requests = JsonCodec.Deserialize(stream.GetBuffer().AsMemory(0, (int)stream.Length));
             }
             catch
             {
-                await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, "invalid json", CancellationToken.None)
-                    .ConfigureAwait(false);
+                try
+                {
+                    await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, "invalid json", CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Peer may already be gone.
+                }
+
                 return;
             }
 
-            _channel.Receive(requests, controller);
+            try
+            {
+                _channel.Receive(requests, controller);
+            }
+            catch
+            {
+                // Keep one bad message (e.g. a throwing event handler) from killing this connection's loop.
+            }
         }
     }
 
