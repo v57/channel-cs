@@ -10,6 +10,12 @@ Powerful and lightweight communication built for modern language. C# implementat
 dotnet add package ChannelCs
 ```
 
+# Dependencies
+
+None outside .NET (net10.0). JSON is `System.Text.Json` and the client is `ClientWebSocket`, both in the base library;
+the server runs on ASP.NET Core (Kestrel), which comes with .NET as the `Microsoft.AspNetCore.App` shared framework
+rather than a NuGet package.
+
 # Usage
 
 ```csharp
