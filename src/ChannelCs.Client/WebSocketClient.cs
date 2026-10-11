@@ -21,6 +21,7 @@ public sealed class WebSocketClient : IConnection, IDisposable
     private long _nextEventId;
     private int _isWaiting;
     private int _isWaitingLength;
+    private int _attempts;
 
     /// <summary>Default cap for one incoming message (TS/Bun's default max payload).</summary>
     public const int DefaultMaxMessageSize = 16 * 1024 * 1024;
@@ -37,6 +38,13 @@ public sealed class WebSocketClient : IConnection, IDisposable
     }
 
     public int MaxMessageSize { get; }
+
+    /// <summary>
+    /// Wait before reconnect attempt <paramref name="attempt"/> (0 = first retry after a close): 100 ms doubling up to
+    /// 5 s, scaled to 50-100% by <paramref name="random"/> (0..1) so clients don't retry in lockstep. Same as TS.
+    /// </summary>
+    public static TimeSpan ReconnectDelay(int attempt, double random) =>
+        TimeSpan.FromMilliseconds(Math.Min(5000, 100 * Math.Pow(2, Math.Min(attempt, 16))) * (0.5 + random / 2));
 
     /// <summary>
     /// Called when the peer sends something this client can't use (undecodable reply, oversized or invalid
@@ -244,6 +252,7 @@ public sealed class WebSocketClient : IConnection, IDisposable
                 var replay = _pending.Values.ToArray();
                 _socket = socket;
                 IsConnected = true;
+                _attempts = 0;
 
                 if (OnOpenAsync is not null)
                 {
@@ -290,7 +299,9 @@ public sealed class WebSocketClient : IConnection, IDisposable
 
             try
             {
-                await Task.Delay(100, _lifetime.Token).ConfigureAwait(false);
+                // Back off while the server stays down instead of retrying every 100 ms forever.
+                await Task.Delay(ReconnectDelay(_attempts++, Random.Shared.NextDouble()), _lifetime.Token)
+                    .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
