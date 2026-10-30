@@ -107,7 +107,8 @@ The client dials each connection, reconnects included, from its own UDP socket, 
 (Network.framework's QUIC servers take one connection per client address and port). It reconnects and replays
 unanswered requests like the WebSocket client, and sends a keepalive every 15 s (idle timeout 30 s).
 
-Which languages support QUIC: see `channel/docs/quic.md`.
+Languages with QUIC: TypeScript, Go, Swift, C#, Rust, Python, Elixir, Java, Kotlin, C and Zig; Dart, Ruby and PHP stay
+on WebSocket (libraries and status in `channel/docs/quic.md`).
 
 # Requirements
 - .NET SDK 10+
