@@ -6,6 +6,11 @@ hub_run="$(dirname "$0")/../../../HubTools/hub-run"
 
 cd "$(dirname "$0")/.."
 
+# The QUIC tests need libmsquic: fetched once into the cache when the system has none (scripts/msquic)
+if msquic=$(scripts/msquic) && [[ -n "$msquic" ]]; then
+  export LD_LIBRARY_PATH="$msquic${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 mkdir -p coverage
 rm -f coverage/unit.info coverage/integration.info coverage/lcov.info
 

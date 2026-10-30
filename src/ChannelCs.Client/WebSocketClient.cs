@@ -1,10 +1,15 @@
 using System.Collections.Concurrent;
+using System.Net.Quic;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 
 namespace ChannelCs.Client;
 
+/// <summary>
+/// The client transport: a WebSocket for <c>ws://</c> and <c>wss://</c> addresses, QUIC (docs/quic.md in the
+/// TypeScript reference) for <c>quic://</c> ones. Both reconnect and replay unanswered requests the same way.
+/// </summary>
 public sealed class WebSocketClient : IConnection, IDisposable
 {
     private readonly Uri _address;
@@ -16,7 +21,10 @@ public sealed class WebSocketClient : IConnection, IDisposable
     private readonly object _stateGate = new();
     private readonly List<object> _queue = [];
 
+    private readonly QuicTrust? _quicTrust;
+
     private ClientWebSocket? _socket;
+    private QuicClientTransport? _quic;
     private long _id;
     private long _nextEventId;
     private int _isWaiting;
@@ -29,13 +37,30 @@ public sealed class WebSocketClient : IConnection, IDisposable
     public WebSocketClient(
         Uri address,
         Func<ValueTask<IReadOnlyDictionary<string, string>>>? headers = null,
-        int maxMessageSize = DefaultMaxMessageSize)
+        int maxMessageSize = DefaultMaxMessageSize,
+        QuicClientOptions? quic = null)
     {
         _address = address;
         _headers = headers;
         MaxMessageSize = maxMessageSize > 0 ? maxMessageSize : DefaultMaxMessageSize;
+        if (IsQuicAddress(address))
+        {
+            if (!QuicConnection.IsSupported)
+            {
+                throw new PlatformNotSupportedException(QuicUnsupportedMessage);
+            }
+
+            _quicTrust = new QuicTrust(quic);
+        }
+
         _ = Task.Run(RunAsync);
     }
+
+    internal const string QuicUnsupportedMessage =
+        "QUIC isn't supported here: System.Net.Quic needs libmsquic (Linux: the libmsquic package; macOS: brew install libmsquic)";
+
+    internal static bool IsQuicAddress(Uri address) =>
+        string.Equals(address.Scheme, "quic", StringComparison.OrdinalIgnoreCase);
 
     public int MaxMessageSize { get; }
 
@@ -162,6 +187,11 @@ public sealed class WebSocketClient : IConnection, IDisposable
         _pending.Clear();
         _lifetime.Cancel();
 
+        if (QuicConnection.IsSupported)
+        {
+            _quic?.Abort();
+        }
+
         try
         {
             _socket?.Abort();
@@ -222,49 +252,45 @@ public sealed class WebSocketClient : IConnection, IDisposable
         while (IsRunning && !_lifetime.IsCancellationRequested)
         {
             ClientWebSocket? socket = null;
+            QuicClientTransport? quic = null;
             try
             {
-                socket = new ClientWebSocket();
-                if (_headers is not null)
+                if (_quicTrust is not null && QuicConnection.IsSupported)
                 {
-                    var headers = await _headers().ConfigureAwait(false);
-                    foreach (var header in headers)
+                    var helloHeaders = _headers is null ? null : await _headers().ConfigureAwait(false);
+                    quic = await QuicClientTransport.ConnectAsync(
+                        _address, helloHeaders, _quicTrust, MaxMessageSize, _lifetime.Token).ConfigureAwait(false);
+                    await RunConnectedAsync(null, quic).ConfigureAwait(false);
+                }
+                else
+                {
+                    socket = new ClientWebSocket();
+                    if (_headers is not null)
                     {
-                        if (!string.IsNullOrEmpty(header.Value))
+                        var headers = await _headers().ConfigureAwait(false);
+                        foreach (var header in headers)
                         {
-                            socket.Options.SetRequestHeader(header.Key, header.Value);
+                            if (!string.IsNullOrEmpty(header.Value))
+                            {
+                                socket.Options.SetRequestHeader(header.Key, header.Value);
+                            }
                         }
                     }
-                }
 
-                try
-                {
-                    await socket.ConnectAsync(_address, _lifetime.Token).ConfigureAwait(false);
-                }
-                catch (WebSocketException exception) when (exception.WebSocketErrorCode == WebSocketError.NotAWebSocket)
-                {
-                    // The server answered but refused the upgrade (e.g. HTTP 500). Queued calls would be resent
-                    // into the same refusal forever: fail them, keep retrying for new ones.
-                    ReportProtocolError("connection rejected by server");
-                    throw;
-                }
+                    try
+                    {
+                        await socket.ConnectAsync(_address, _lifetime.Token).ConfigureAwait(false);
+                    }
+                    catch (WebSocketException exception) when (exception.WebSocketErrorCode == WebSocketError.NotAWebSocket)
+                    {
+                        // The server answered but refused the upgrade (e.g. HTTP 500). Queued calls would be resent
+                        // into the same refusal forever: fail them, keep retrying for new ones.
+                        ReportProtocolError("connection rejected by server");
+                        throw;
+                    }
 
-                var replay = _pending.Values.ToArray();
-                _socket = socket;
-                IsConnected = true;
-                _attempts = 0;
-
-                if (OnOpenAsync is not null)
-                {
-                    await OnOpenAsync().ConfigureAwait(false);
+                    await RunConnectedAsync(socket, null).ConfigureAwait(false);
                 }
-
-                if (replay.Length > 0)
-                {
-                    await SendRawAsync(replay).ConfigureAwait(false);
-                }
-
-                await ReceiveLoopAsync(socket).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
             {
@@ -288,6 +314,16 @@ public sealed class WebSocketClient : IConnection, IDisposable
                     _socket = null;
                 }
 
+                if (quic is not null && QuicConnection.IsSupported)
+                {
+                    if (ReferenceEquals(_quic, quic))
+                    {
+                        _quic = null;
+                    }
+
+                    await quic.DisposeAsync().ConfigureAwait(false);
+                }
+
                 IsConnected = false;
                 OnClose?.Invoke();
 
@@ -306,6 +342,86 @@ public sealed class WebSocketClient : IConnection, IDisposable
             catch (OperationCanceledException)
             {
                 break;
+            }
+        }
+    }
+
+    /// <summary>Marks the new connection open, replays what is unanswered and receives until it closes.</summary>
+    private async Task RunConnectedAsync(ClientWebSocket? socket, QuicClientTransport? quic)
+    {
+        var replay = _pending.Values.ToArray();
+        _socket = socket;
+        if (quic is not null && QuicConnection.IsSupported)
+        {
+            _quic = quic;
+        }
+
+        IsConnected = true;
+        _attempts = 0;
+
+        if (OnOpenAsync is not null)
+        {
+            await OnOpenAsync().ConfigureAwait(false);
+        }
+
+        if (replay.Length > 0)
+        {
+            await SendRawAsync(replay).ConfigureAwait(false);
+        }
+
+        if (quic is not null && QuicConnection.IsSupported)
+        {
+            await QuicReceiveLoopAsync(quic).ConfigureAwait(false);
+        }
+        else if (socket is not null)
+        {
+            await ReceiveLoopAsync(socket).ConfigureAwait(false);
+        }
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    [System.Runtime.Versioning.SupportedOSPlatform("macos")]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private async Task QuicReceiveLoopAsync(QuicClientTransport quic)
+    {
+        while (IsRunning && !_lifetime.IsCancellationRequested)
+        {
+            byte[]? payload;
+            try
+            {
+                payload = await quic.Reader.ReadAsync(_lifetime.Token).ConfigureAwait(false);
+            }
+            catch (QuicFrameTooLargeException)
+            {
+                ReportProtocolError("message too big");
+                return;
+            }
+
+            if (payload is null)
+            {
+                return;
+            }
+
+            IReadOnlyList<ChannelMessage> messages;
+            try
+            {
+                messages = JsonCodec.Deserialize(payload);
+            }
+            catch (Exception exception) when (exception is JsonException or InvalidOperationException
+                or ArgumentException or DecoderFallbackException)
+            {
+                // The reply can't be matched to its request: settle the pending calls instead of hanging them.
+                ReportProtocolError("invalid message from server");
+                continue;
+            }
+
+            try
+            {
+                OnMessage?.Invoke(messages);
+            }
+            catch
+            {
+                // Errors in response/handler callbacks stay local to that message.
             }
         }
     }
@@ -397,6 +513,14 @@ public sealed class WebSocketClient : IConnection, IDisposable
 
     private async Task SendRawAsync(object body)
     {
+        var quic = _quic;
+        if (quic is not null && QuicConnection.IsSupported)
+        {
+            // Frames queue up in the writer, in order, without waiting for flow control
+            quic.Writer.Write(JsonCodec.Serialize(body));
+            return;
+        }
+
         var socket = _socket;
         if (socket is null || socket.State != WebSocketState.Open)
         {

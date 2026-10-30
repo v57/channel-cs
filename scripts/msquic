@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Prints a directory holding libmsquic, the native library System.Net.Quic loads on Linux, for LD_LIBRARY_PATH.
+# Nothing when the system already has it (or isn't Linux). Otherwise it extracts the Debian 13 packages of libmsquic
+# (packages.microsoft.com) and libnuma1 (its one dependency the Hub toolchain image lacks) into
+# $HOME/.cache/msquic once; HOME is the persistent cache volume in the Hub toolchain container.
+set -euo pipefail
+
+[[ "$(uname -s)" == Linux ]] || exit 0
+ldconfig -p 2>/dev/null | grep -q 'libmsquic\.so' && exit 0
+
+msquic=2.5.6
+numa=2.0.19-1+b2
+case "$(uname -m)" in
+  aarch64 | arm64) arch=arm64 ;;
+  x86_64) arch=amd64 ;;
+  *) echo "msquic: no package for $(uname -m)" >&2; exit 1 ;;
+esac
+
+root="$HOME/.cache/msquic/$msquic-$arch"
+lib="$root/usr/lib/$(uname -m)-linux-gnu"
+if [[ ! -e "$lib/libmsquic.so.2" ]]; then
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  curl -fsSL -o "$work/msquic.deb" \
+    "https://packages.microsoft.com/debian/13/prod/pool/main/libm/libmsquic/libmsquic_${msquic}_$arch.deb"
+  curl -fsSL -o "$work/numa.deb" "https://deb.debian.org/debian/pool/main/n/numactl/libnuma1_${numa}_$arch.deb"
+  mkdir -p "$work/root"
+  dpkg-deb -x "$work/msquic.deb" "$work/root"
+  dpkg-deb -x "$work/numa.deb" "$work/root"
+  mkdir -p "$(dirname "$root")"
+  rm -rf "$root"
+  mv "$work/root" "$root"
+fi
+echo "$lib"

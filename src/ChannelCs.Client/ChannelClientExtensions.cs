@@ -12,6 +12,10 @@ public static class ChannelClientExtensions
         return channel.Connect($"ws://127.0.0.1:{port}", options);
     }
 
+    /// <summary>
+    /// Connects to <c>ws://host:port</c>, <c>wss://…</c> or <c>quic://host:port</c> (QUIC, see
+    /// <see cref="ClientOptions{TState}.Quic"/>), and keeps reconnecting until stopped.
+    /// </summary>
     public static ClientSender<TState> Connect<TState>(
         this Channel<TState> channel,
         string address,
@@ -19,7 +23,7 @@ public static class ChannelClientExtensions
     {
         options ??= new ClientOptions<TState>();
 
-        var webSocket = new WebSocketClient(new Uri(address), options.Headers, options.MaxMessageSize);
+        var webSocket = new WebSocketClient(new Uri(address), options.Headers, options.MaxMessageSize, options.Quic);
         var sender = channel.CreateSender(webSocket);
         var topics = new ConcurrentDictionary<string, byte>();
         var state = options.StateFactory is not null

@@ -11,6 +11,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="ChannelCs.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../ChannelCs/ChannelCs.csproj" />
   </ItemGroup>
 

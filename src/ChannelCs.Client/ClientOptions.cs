@@ -10,4 +10,7 @@ public sealed class ClientOptions<TState>
 
     /// <summary>Largest incoming message accepted, in bytes (default 16 MiB, like TS/Bun).</summary>
     public int MaxMessageSize { get; init; } = WebSocketClient.DefaultMaxMessageSize;
+
+    /// <summary>TLS settings for <c>quic://</c> addresses (CA, pinned fingerprint, server name).</summary>
+    public QuicClientOptions? Quic { get; init; }
 }
